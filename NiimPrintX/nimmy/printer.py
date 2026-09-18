@@ -27,6 +27,7 @@ class InfoEnum(enum.IntEnum):
 
 
 class RequestCodeEnum(enum.IntEnum):
+    CONNECT = 193  # 0xC1
     GET_INFO = 64  # 0x40
     GET_RFID = 26  # 0x1A
     HEARTBEAT = 220  # 0xDC
@@ -40,6 +41,7 @@ class RequestCodeEnum(enum.IntEnum):
     SET_DIMENSION = 19  # 0x13
     SET_QUANTITY = 21  # 0x15
     GET_PRINT_STATUS = 163  # 0xA3
+    PRINTER_STATUS_DATA = 165  # 0xA5
 
 
 class PrinterClient:
@@ -49,6 +51,7 @@ class PrinterClient:
         self.transport = BLETransport()
         self.notification_event = asyncio.Event()
         self.notification_data = None
+        self.protocol_version = None
 
     async def connect(self):
         if await self.transport.connect(self.device.address):
@@ -83,6 +86,36 @@ class PrinterClient:
                     self.char_uuid = characteristics[0]['id']  # Return the service ID that meets the criteria
         if not self.char_uuid:
             raise PrinterException("Cannot find bluetooth characteristics.")
+
+    async def negotiate_protocol(self):
+        """Detect the printer's protocol version.
+
+        Version 4+ printers (e.g. D110_M, D11_H) use a different print sequence
+        than older models, so the version must be known before printing.
+        """
+        response = await self.send_command(RequestCodeEnum.CONNECT, b"\x01")
+        if response is None or not response.data:
+            response = await self.send_command(RequestCodeEnum.CONNECT, b"\x01")
+        if response is None or not response.data:
+            logger.warning("Could not determine printer protocol version")
+            return self.protocol_version
+
+        connect_result = response.data[0]
+        if connect_result == 3:  # new firmware, version is reported by the printer
+            status = await self.send_command(RequestCodeEnum.PRINTER_STATUS_DATA, b"\x01")
+            if status and len(status.data) >= 13:
+                firmware = status.data[11] * 100 + status.data[12]
+                if 204 <= firmware < 300:
+                    self.protocol_version = 3
+                elif 300 <= firmware < 302:
+                    self.protocol_version = 4
+                elif firmware >= 302:
+                    self.protocol_version = 5
+        elif connect_result == 2:  # new firmware, old protocol
+            self.protocol_version = 1
+
+        logger.info(f"Printer protocol version: {self.protocol_version}")
+        return self.protocol_version
 
     async def send_command(self, request_code, data, timeout=10):
         try:
@@ -127,6 +160,16 @@ class PrinterClient:
 
     async def print_image(self, image: Image, density: int = 3, quantity: int = 1, vertical_offset= 0,
                           horizontal_offset = 0):
+        if self.protocol_version is None:
+            await self.negotiate_protocol()
+
+        if self.protocol_version is not None and self.protocol_version >= 4:
+            await self._print_image_v4(image, density, quantity, vertical_offset, horizontal_offset)
+        else:
+            await self._print_image_legacy(image, density, quantity, vertical_offset, horizontal_offset)
+
+    async def _print_image_legacy(self, image: Image, density: int, quantity: int, vertical_offset: int,
+                                  horizontal_offset: int):
         await self.set_label_density(density)
         await self.set_label_type(1)
         await self.start_print()
@@ -143,13 +186,55 @@ class PrinterClient:
         while not await self.end_page_print():
             await asyncio.sleep(0.05)
 
-        while True:
-            status = await self.get_print_status()
-            if status['page'] == quantity:
-                break
-            await asyncio.sleep(0.1)
+        await self.wait_for_print_finished(quantity)
 
         await self.end_print()
+
+    async def _print_image_v4(self, image: Image, density: int, quantity: int, vertical_offset: int,
+                              horizontal_offset: int):
+        # Protocol version >= 4 (D110_M, D11_H, ...) sequence:
+        # PrintStart(9 bytes) -> PrintStatus(decoy) -> PageSize(13 bytes, includes copies)
+        # -> image rows -> PageEnd -> status poll -> PrintEnd -> Heartbeat(decoy)
+        await self.set_label_type(1)
+        await self.set_label_density(density)
+
+        # total pages + 4 reserved bytes + page color + speed + reserved flag
+        await self.send_command(
+            RequestCodeEnum.START_PRINT,
+            struct.pack(">H7B", quantity, 0, 0, 0, 0, 0, 1, 0),
+        )
+
+        # Some printers do not answer the first packet sent after PrintStart, so send a
+        # print status request as a decoy and do not wait for its response.
+        await self.write_no_notify(RequestCodeEnum.GET_PRINT_STATUS, b"\x01")
+
+        # rows, columns, copies, cut height, cut type, reserved, send all, part height
+        await self.send_command(
+            RequestCodeEnum.SET_DIMENSION,
+            struct.pack(">HHHHBBBH", image.height, image.width, quantity, 0, 0, 0, 0, 0),
+        )
+
+        for pkt in self._encode_image(image, vertical_offset, horizontal_offset):
+            await self.write_raw(pkt)
+            await asyncio.sleep(0.01)
+
+        await self.send_command(RequestCodeEnum.END_PAGE_PRINT, b"\x01")
+
+        await self.wait_for_print_finished(quantity)
+
+        await self.end_print()
+        # Some printers drop the first packet sent after PrintEnd; send a heartbeat decoy.
+        await self.write_no_notify(RequestCodeEnum.HEARTBEAT, b"\x01")
+
+    async def wait_for_print_finished(self, quantity, timeout=60):
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            status = await self.get_print_status()
+            if status and status["page"] == quantity:
+                return
+            if asyncio.get_running_loop().time() > deadline:
+                raise PrinterException("Timed out waiting for the print job to finish")
+            await asyncio.sleep(0.1)
 
     def _encode_image(self, image: Image, vertical_offset=0, horizontal_offset=0):
         # Convert the image to monochrome
@@ -294,11 +379,14 @@ class PrinterClient:
 
     async def get_print_status(self):
         packet = await self.send_command(RequestCodeEnum.GET_PRINT_STATUS, b"\x01")
+        if not packet or len(packet.data) < 4:
+            return None
         page, progress1, progress2 = struct.unpack(">HBB", packet.data[:4])
         return {"page": page, "progress1": progress1, "progress2": progress2}
 
     def __del__(self):
-        if self.transport.client.is_connected:
+        transport = getattr(self, "transport", None)
+        if transport and transport.client and transport.client.is_connected:
             loop = asyncio.get_event_loop()
             if loop.is_running():
                 loop.create_task(self.disconnect())
