@@ -10,7 +10,7 @@ logger = get_logger()
 async def find_device(device_name_prefix=None):
     devices = await BleakScanner.discover()
     for device in devices:
-        if device.name and device.name.lower().startswith(device_name_prefix.lower())  and len(device.metadata['uuids'])==0:
+        if device.name and device.name.lower().startswith(device_name_prefix.lower()):
             return device
     raise BLEException(f"Failed to find device {device_name_prefix}")
 
@@ -37,11 +37,8 @@ class BLETransport:
         # Automatically connect if address is provided during initialization
         if self.address:
             self.client = BleakClient(self.address)
-            if await self.client.connect():
-                logger.info(f"Connected to {self.address}")
-                return self
-            else:
-                raise BLEException(f"Failed to connect to the BLE device at {self.address}")
+            await self.client.connect()
+            logger.info(f"Connected to {self.address}")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -53,8 +50,8 @@ class BLETransport:
         if self.client is None:
             self.client = BleakClient(address)
         if not self.client.is_connected:
-            return await self.client.connect()
-        return False
+            await self.client.connect()
+        return self.client.is_connected
 
     async def disconnect(self):
         if self.client and self.client.is_connected:
