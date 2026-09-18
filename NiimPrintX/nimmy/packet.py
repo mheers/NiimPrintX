@@ -6,6 +6,9 @@ def packet_to_int(x):
 
 
 class NiimbotPacket:
+    # Connect (0xC1) is the only command whose frame is prefixed with 0x03.
+    CONNECT = 0xC1
+
     def __init__(self, type_, data):
         self.type = type_
         self.data = data
@@ -29,9 +32,14 @@ class NiimbotPacket:
         checksum = self.type ^ len(self.data)
         for i in self.data:
             checksum ^= i
-        return bytes(
+        packet = bytes(
             (0x55, 0x55, self.type, len(self.data), *self.data, checksum, 0xAA, 0xAA)
         )
+        if self.type == self.CONNECT:
+            # The Connect request is the only packet that carries a 0x03 prefix
+            # before the standard 0x55 0x55 header.
+            return b"\x03" + packet
+        return packet
 
     def __repr__(self):
         return f"<NiimbotPacket type={self.type} data={self.data}>"
